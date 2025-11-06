@@ -1,0 +1,949 @@
+---
+title: "Rmarkdown november"
+output:
+  word_document: default
+  pdf_document: default
+  html_document: default
+---
+
+# Task 1
+
+**Goal:** Filter, summarize, and group bulk counts.
+
+**Data:** bulk_counts_long.csv, sample_metadata.csv
+
+**Tasks:**
+
+1.  Keep counts for samples in condition == “treated” and genes starting with “GENE_00”.
+
+2.  Compute mean and median count by gene.
+
+3.  Join sample metadata and compute per-condition mean counts by gene in one pipeline.
+
+```{r}
+#load the library
+library(data.table)
+# Load data.table package and read in the counts data from a CSV file
+counts <- fread("bulk_counts_long.csv")     
+
+# Read in sample metadata from a CSV file
+metadata <- fread("sample_metadata.csv")     
+
+# Filter counts to keep only genes whose names start with "GENE_00"
+counts_filtered <- counts[gene %like% "^GENE_00"]  
+
+# Filter metadata to keep only samples with the condition "treated"
+metadata_filtered <- metadata[condition == "treated"]
+
+# Merge the filtered counts and metadata by the "sample_id" column
+DT <- merge(counts_filtered, metadata_filtered, by = "sample_id")
+
+# Calculate mean and median counts for each gene
+summary_dt <- DT[, .(
+  mean_count = mean(count),   # mean of counts for each gene
+  median_count = median(count) # median of counts for each gene
+), by = gene]
+
+# Display the first 5 rows of the summary table
+head(summary_dt, 5)
+
+```
+
+This table shows the average expression level of selected genes in treated samples, giving a concise summary of gene activity across the dataset.
+
+So, for example: GENE_0049 has an average count of 7.466667 , which means it’s less expressed than GENE_0054 (12.33) under the treated condition.
+
+# Task 2
+
+**Goal**: Add QC-style derived columns without copying. **Data**: bulk_counts_long.csv **Tasks**:
+
+1.  Add la log2 counts column and a binary flag high if count \> 100.
+
+2.  Overwrite high to use a gene-wise threshold (e.g., count \> median(count) by=gene).
+
+    ```{r}
+    #load the library library(data.table)
+
+    #read the data 
+    counts <- fread("bulk_counts_long.csv")
+
+    # Add columns
+    counts[, log2_count := log2(count + 1)]
+    counts[, high := count > 100]
+
+    # Overwrite high using the threshold for each gene.
+
+    counts[, high := count > median(count), by = gene]
+
+    #visualise the results head(counts)
+    head(counts, 5)
+    ```
+
+This function enhances your count table by adding two key features for each gene: a normalized log₂ expression measure and a “high expression” indicator.
+
+-   **log2_count**: The log₂-transformed count, calculated as `log2(count + 1)`, which normalizes expression levels and accommodates zero counts
+
+-   **high**: A logical flag (`TRUE` or `FALSE`) indicating whether a gene’s count in a given sample exceeds its median count across all samples
+
+The resulting table facilitates rapid identification of highly expressed genes and straightforward comparison of relative expression levels across samples.
+
+# Task 3
+
+**Goal:** Speed up joins/lookups
+
+**Data:** sample_metadata.csv, bulk_counts_long.csv
+
+**Tasks:**
+
+-   setkey() on sample_metadata by sample_id; equi-join into the long counts.
+
+-   Add a secondary index on (gene, sample_id) in the counts table, then benchmark a subset query before/after.
+
+```{r}
+library(data.table)
+library(microbenchmark)
+
+
+# Read in the data
+
+sample_metadata <- fread("sample_metadata.csv")
+bulk_counts_long <- fread("bulk_counts_long.csv")
+
+
+# Set key on sample_metadata
+
+setkey(sample_metadata, sample_id)
+
+
+# Equi-join: add metadata columns to bulk_counts_long
+
+bulk_counts_long <- sample_metadata[bulk_counts_long, on = "sample_id"]
+
+
+# Define test query subsets
+
+gene_subset <- c("GeneA", "GeneB", "GeneC")
+sample_subset <- c("Sample1", "Sample2")
+
+
+# Benchmark BEFORE secondary index
+
+# Use a fresh copy without index
+bulk_counts_long_before <- copy(bulk_counts_long)
+
+bm_before <- microbenchmark(
+  subset_before = bulk_counts_long_before[gene %in% gene_subset & sample_id %in% sample_subset],
+  times = 10
+)
+
+# Create secondary index
+
+setindex(bulk_counts_long, gene, sample_id)
+
+
+# Benchmark AFTER secondary index
+
+bm_after <- microbenchmark(
+  subset_after = bulk_counts_long[gene %in% gene_subset & sample_id %in% sample_subset],
+  times = 10
+)
+
+
+# Convert benchmark results to data.table
+dt_before <- as.data.table(bm_before)
+dt_before[, scenario := "before_index"]
+
+dt_after <- as.data.table(bm_after)
+dt_after[, scenario := "after_index"]
+
+# Combine both
+dt_all <- rbind(dt_before, dt_after)
+
+
+# Create summary table of timings (milliseconds)
+
+summary_times <- dt_all[, .(
+  mean_time_ms = mean(time) / 1e6,   # nanoseconds → milliseconds
+  median_time_ms = median(time) / 1e6,
+  min_time_ms = min(time) / 1e6,
+  max_time_ms = max(time) / 1e6,
+  n = .N
+), by = scenario]
+
+
+# Print summary table
+
+print(summary_times)
+
+
+```
+
+This function measures the time required to subset `bulk_counts_long` for the selected genes and samples, both with and without secondary indexing.
+
+It allows for a direct comparison of performance between the two approaches. The results indicate that indexing slightly affects performance: the mean query time changes from 2.616 ms without indexing to 3.198 ms with indexing, suggesting that in this scenario, indexing does not provide a speed advantage for these small queries.
+
+# Task 4
+
+**Goal**: Annotate counts with sample and patient info. **Data**: bulk_counts_long.csv, sample_metadata.csv **Tasks**:
+
+-   Join and compute per-patient total counts.
+
+-   Find the top 10 genes by average count within each condition.
+
+```{r}
+library(data.table)
+
+# Load data
+counts <- fread("bulk_counts_long.csv")      
+meta   <- fread("sample_metadata.csv")       
+
+# Join sample metadata to counts
+dt <- merge(counts, meta, by = "sample_id", all.x = TRUE)
+
+# Compute per-patient total counts
+patient_totals <- dt[, .(total_count = sum(count)), by = .(patient_id)]
+
+# Merge back if you want totals annotated in the main table
+dt <- merge(dt, patient_totals, by = "patient_id", all.x = TRUE)
+
+# Find top 10 genes by average count within each condition
+top_genes <- dt[, .(avg_count = mean(count)), by = .(condition, gene)
+][order(condition, -avg_count)
+][, head(.SD, 10), by = condition]
+
+# Save results
+fwrite(patient_totals, "per_patient_total_counts.csv")
+fwrite(top_genes, "top10_genes_by_condition.csv")
+
+```
+
+```{r}
+#visualise results: top genes for each condition
+print(top_genes)
+
+```
+
+```{r}
+#visualise results: total gene expression counts 
+head(patient_totals, 5)
+```
+
+The first output identifies the top 10 genes with the highest average expression counts within each experimental condition (“control” and “treated”). These top genes highlight the most strongly expressed transcripts in each group, facilitating comparison of dominant expression patterns between conditions.
+
+The second output presents the total gene expression counts for each patient, providing an overview of sequencing depth and overall expression activity across all genes.
+
+Together, these results offer both a patient-level summary and a condition-level gene ranking, serving as a useful foundation for exploratory analysis of expression trends.
+
+# Task 5
+
+**Goal**: Classify values against reference intervals. **Data**: clinical_labs.csv, lab_reference_ranges.csv, plus sample_metadata.csv (for sex proxy if you want to extend) **Tasks**:
+
+-   Treat reference ranges as intervals and label each lab as "normal" vs "out_of_range" using a non-equi join (value \>= lower & value \<= upper).
+
+-   Count abnormal rates by patient and by lab.
+
+```{r}
+library(data.table)
+
+# Load data
+clinical_labs <- fread("clinical_labs.csv")          
+lab_reference <- fread("lab_reference_ranges.csv")   
+sample_metadata <- fread("sample_metadata.csv")      
+
+# Convert to data.table
+setDT(clinical_labs)
+setDT(lab_reference)
+setDT(sample_metadata)
+
+# Prepare intervals for foverlaps
+# Each lab value becomes an interval [value, value]
+clinical_labs[, value_start := value]
+clinical_labs[, value_end := value]
+
+# lab_reference already has [lower, upper] as intervals
+setkey(lab_reference, lab, lower, upper)
+setkey(clinical_labs, lab, value_start, value_end)
+
+# Perform interval join
+classified <- foverlaps(clinical_labs, lab_reference, 
+                        by.x = c("lab", "value_start", "value_end"), 
+                        by.y = c("lab", "lower", "upper"), 
+                        type = "within", nomatch = 0L)
+
+# Mark normal values
+classified[, status := "normal"]
+
+# Identify out-of-range values
+out_of_range <- clinical_labs[!classified, on = .(patient_id, lab, value_start, value_end)]
+out_of_range[, status := "out_of_range"]
+
+# Combine normal and out-of-range
+classified_labs <- rbindlist(list(classified, out_of_range), fill = TRUE)
+
+# Count abnormal rates by patient
+abnormal_by_patient <- classified_labs[, .(
+  total_labs = .N,
+  abnormal_count = sum(status == "out_of_range"),
+  abnormal_rate = sum(status == "out_of_range") / .N
+), by = patient_id]
+
+# Merge with metadata
+abnormal_by_patient <- merge(abnormal_by_patient, sample_metadata, by = "patient_id", all.x = TRUE)
+
+# Count abnormal rates by lab
+abnormal_by_lab <- classified_labs[, .(
+  total_patients = .N,
+  abnormal_count = sum(status == "out_of_range"),
+  abnormal_rate = sum(status == "out_of_range") / .N
+), by = lab]
+
+# Save results
+fwrite(classified_labs, "classified_labs.csv")
+fwrite(abnormal_by_patient, "abnormal_by_patient.csv")
+fwrite(abnormal_by_lab, "abnormal_by_lab.csv")
+
+
+```
+
+```{r}
+#visualise results
+print(abnormal_by_lab)
+```
+
+```{r}
+#visualise results 
+head(abnormal_by_patient, 5)
+```
+
+The **abnormal_by_patient** table summarizes abnormality rates for each patient:
+
+-   **total_labs** indicates the total number of lab results per patient.
+
+-   **abnormal_count** counts how many results fall outside the reference range.
+
+-   **abnormal_rate** shows the proportion of abnormal results, highlighting variation in individual clinical profiles.
+
+The **abnormal_by_lab** table summarizes abnormality rates for each laboratory test:
+
+-   For instance, CRP exhibits a higher abnormal rate (0.311), indicating it frequently falls outside the normal range, whereas WBC shows fewer abnormalities (0.059)
+
+This allows identification of lab tests that most commonly deviate from normal values across the cohort.
+
+# Task 7
+
+**Goal**: Slice genomics windows efficiently. **Data**: atac_peaks.bed.csv **Tasks**:
+
+-   Extract peaks on chr2 with start between 2‚Äì4 Mb.
+
+-   Among those peaks, return the top 50 by score after setorder() (descending).
+
+```{r}
+# Load data.table
+library(data.table)
+
+# Load your CSV as a data.table
+peaks <- fread("atac_peaks.bed.csv")
+
+# Filter for chr2 and start between 2-4 Mb
+chr2_peaks <- peaks[chr == "chr2" & start >= 2e6 & start <= 4e6]
+
+# Order by score descending
+setorder(chr2_peaks, -score)
+
+# Take top 50
+top50_peaks <- chr2_peaks[1:50]
+
+# View result
+head(top50_peaks, 5)
+
+```
+
+The output lists the top 5 genomic peaks on chromosome 2 within the coordinate range 2,000,000–4,000,000.\
+Each row corresponds to a peak and includes its start and end positions, a unique **peak_id**, and an associated **score**.\
+Peaks are sorted in descending order of score, so the first row represents the highest-scoring (most significant) peak in this region.\
+These results highlight the strongest genomic signals within the interval, often indicating areas of high biological activity such as transcription factor binding or chromatin accessibility.
+
+# Task 8
+
+**Goal**: Multi-column operations per group. **Data**: bulk_counts_long.csv, sample_metadata.csv **Tasks**:
+
+-   Compute per-condition robust summary stats for each gene: mean, median, Q1/Q3.
+
+-   Return only genes where treated mean ‚â• 2√ó control mean.
+
+```{r}
+# Load libraries
+library(data.table)
+
+#  Load Data
+# Assuming your files are CSVs in working directory
+counts <- fread("bulk_counts_long.csv")        
+metadata <- fread("sample_metadata.csv")     
+
+#  Merge data with metadata
+dt <- merge(counts, metadata, by = "sample_id")
+
+# Compute per-condition robust summary stats per gene 
+summary_dt <- dt[, .(
+  mean_count = mean(count, na.rm = TRUE),
+  median_count = median(count, na.rm = TRUE),
+  Q1 = quantile(count, 0.25, na.rm = TRUE),
+  Q3 = quantile(count, 0.75, na.rm = TRUE)
+), by = .(gene, condition)]
+
+#  Reshape to wide format for easy comparison
+summary_wide <- dcast(summary_dt, gene ~ condition, value.var = "mean_count")
+
+# Filter genes where treated mean ≥ 2 * control mean
+filtered_genes <- summary_wide[(treated >= 2 * control), .(gene, control, treated)]
+
+# Merge median, Q1, Q3 for filtered genes
+other_stats <- dcast(summary_dt, gene ~ condition, value.var = c("median_count", "Q1", "Q3"))
+result <- merge(filtered_genes, other_stats, by = "gene")
+
+# Save results
+fwrite(result, "filtered_gene_summary.csv")
+
+# Done
+head(result,5)
+
+```
+
+The table lists the **top 5 genes** where the **average expression** in the treated samples is **at least double** that of the control samples.
+
+Each row represents one gene, with two columns showing its mean expression under each condition.
+
+For example, GENE_0020 has an average treated expression of 93.73, much higher than its control mean of 28.44, indicating strong upregulation after treatment.
+
+These results highlight genes potentially activated or upregulated in response to treatment.
+
+# Task 9
+
+**Goal**: Go wide‚ to long‚ to wide for downstream plotting. **Data**: bulk_counts_wide.csv **Tasks**:
+
+-   Convert the matrix to long, add per-sample totals, then back to a gene per condition table with mean counts.
+
+```{r}
+# Load required library
+library(data.table)
+
+
+# Load the wide data
+bulk_counts <- fread("bulk_counts_wide.csv")  
+
+# Check the structure
+head(bulk_counts)
+
+# Convert from wide to long format
+# melt: id.vars = "gene" keeps the gene column, others become variable "sample"
+long_counts <- melt(bulk_counts, 
+                    id.vars = "gene", 
+                    variable.name = "sample", 
+                    value.name = "count")
+
+# Add per-sample totals
+# Sum counts per sample
+sample_totals <- long_counts[, .(total_count = sum(count)), by = sample]
+
+# Merge totals back into long_counts
+long_counts <- merge(long_counts, sample_totals, by = "sample")
+
+
+# Aggregate to gene per condition table
+# Assuming sample names encode condition info, e.g., "CondA_1", "CondB_2", etc.
+# Extract condition from sample name (adjust pattern to your naming)
+long_counts[, condition := tstrsplit(sample, "_")[[1]]]
+
+# Compute mean counts per gene per condition
+gene_condition_means <- long_counts[, .(mean_count = mean(count)), by = .(gene, condition)]
+
+# Convert back to wide format (genes as rows, conditions as columns)
+wide_gene_condition <- dcast(gene_condition_means, gene ~ condition, value.var = "mean_count")
+
+# Save for downstream plotting
+fwrite(wide_gene_condition, "gene_condition_mean_counts.csv")
+
+# Quick check
+head(wide_gene_condition, 5)
+
+
+```
+
+The table shows read counts for different genes (`GENE_0356`, `GENE_0233`, `GENE_0232`, `GENE_0160`, `GENE_0049`, `GENE_0245`) across multple samples (`S01`–`S24`).
+
+Each row corresponds to a gene, and each column represents a sample. The counts reflect the abundance of each gene in the respective sample: for example, `GENE_0232` has consistently high counts across most samples, indicating it is more highly expressed, whereas `GENE_0356` has generally lower counts, suggesting lower expression. This wide-format table is suitable for downstream analyses such as normalization, plotting, or calculation of per-gene averages across samples or conditions.
+
+# Task 10
+
+**Goal**: ATAC-to-gene mapping. **Data**: atac_peaks.bed.csv, gene_annotation.bed.csv **Tasks**:
+
+-   setkey() both on (chr, start, end) and intersect peaks with gene bodies.
+
+-   Count peaks per gene.
+
+-   Compute overlap length (bp) per peak-gene pair and then sum per gene (as in your slides).
+
+-   Return the top 20 genes by total overlapped bp.
+
+```{r}
+# Load required library
+library(data.table)
+
+# Load data
+atac <- fread("atac_peaks.bed.csv")        
+genes <- fread("gene_annotation.bed.csv")   
+
+# Ensure numeric columns are numeric
+atac[, `:=`(start = as.numeric(start), end = as.numeric(end))]
+genes[, `:=`(start = as.numeric(start), end = as.numeric(end))]
+
+# Set keys for fast overlap joins
+setkey(atac, chr, start, end)
+setkey(genes, chr, start, end)
+
+# Find overlaps using foverlaps
+# foverlaps requires the 'x' table (atac) to have start <= end
+# 'y' table (genes) is the reference
+overlaps <- foverlaps(atac, genes, nomatch = 0)  # nomatch=0 drops non-overlapping
+
+# Compute overlap length for each peak-gene pair
+overlaps[, overlap_bp := pmin(end, i.end) - pmax(start, i.start) + 1]
+
+# Sum overlap length per gene
+gene_overlap <- overlaps[, .(
+  peak_count = .N,                  # number of peaks per gene
+  total_overlap_bp = sum(overlap_bp)  # total overlapped base pairs
+), by = gene]
+
+# Get top 20 genes by total_overlap_bp
+top_genes <- gene_overlap[order(-total_overlap_bp)][1:20]
+
+# Print results
+print(top_genes)
+
+```
+
+The table lists the top 20 genes with the greatest total overlap between genomic peaks and gene coordinates.\
+
+**total_overlap_bp** represents the sum of overlapping base pairs between all peaks and each gene.\
+
+For example, **GENE_0437** has 13,421 bp of overlap, indicating a strong association with the observed peaks.\
+
+These results help identify genes that are most likely affected or regulated by the genomic regions represented by the peaks.
+
+# Task 11
+
+**Goal**: Map SNPs to genes. **Data**: variants.csv, gene_annotation.bed.csv **Tasks**:
+
+-   Convert variant positions to 1-bp intervals (pos, pos) and find overlaps with gene intervals.
+
+-   Summarize counts of HIGH impact variants by gene and by sample.
+
+-   List genes with HIGH-impact variants across all samples
+
+```{r}
+# Load the libary
+library(data.table)
+
+variants <- fread("variants.csv")  
+genes <- fread("gene_annotation.bed.csv")  
+
+# Normalize column names (lowercase)
+  setnames(variants, tolower(names(variants)))
+  setnames(genes, tolower(names(genes)))
+  
+  
+# Convert SNP positions to 1-bp intervals 
+  variants[, `:=`(start = as.numeric(pos), end = as.numeric(pos))]
+  genes[, `:=`(start = as.numeric(start), end = as.numeric(end))]
+  
+# Perform interval overlap using foverlaps 
+  # Set keys
+  setkey(variants, chr, start, end)
+  setkey(genes, chr, start, end)
+  
+  # Find overlaps (SNP within gene interval)
+  merged <- foverlaps(variants, genes, nomatch = 0)
+  
+# Keep only HIGH-impact variants
+  merged_hi <- merged[impact == "HIGH"]
+  
+# Summaries 
+  # Count per gene
+  gene_counts <- merged_hi[, .(HIGH_impact_count = .N), by = gene]
+  
+# Count per gene per sample
+  if ("sample_id" %in% names(merged_hi)) {
+    gene_sample_counts <- merged_hi[, .(HIGH_impact_count = .N), by = .(gene, sample_id)]
+  } else if ("sample" %in% names(merged_hi)) {
+    gene_sample_counts <- merged_hi[, .(HIGH_impact_count = .N), by = .(gene, sample)]
+  } else {
+    stop("No sample column found (expected 'sample' or 'sample_id').")
+  }
+  
+# Genes with HIGH-impact variants across all samples 
+  n_samples <- uniqueN(gene_sample_counts[[names(gene_sample_counts)[2]]])
+  genes_with_high_ <- gene_sample_counts[, .N, by = gene][N == n_samples, gene]
+  
+
+```
+
+```{r}
+# visualise HIGH-impact variants per gene 
+  head(gene_counts, 6)
+```
+
+```{r}
+# visualise HIGH-impact variants per gene per sample 
+  head(gene_sample_counts, 6)
+```
+
+```{r}
+# visualise genes with HIGH-impact variants across all samples 
+  print(head(genes_with_high_, 20))
+```
+
+The analysis identified HIGH-impact variants mapped to individual genes across multiple samples.
+
+The `gene_counts` table confirms that these variants are sparse, with most genes having only a single HIGH-impact SNP across all samples.
+
+The `gene_sample_counts` table shows that each of the listed genes (e.g., `GENE_0049`, `GENE_0276`, `GENE_0417`) carries one HIGH-impact variant in the corresponding sample.
+
+Notably, the `genes_with_high_` result is empty, indicating that no gene harbors HIGH-impact variants in every sample—suggesting that these potentially deleterious variants are sample-specific rather than universally shared.
+
+# Task 12
+
+**Goal**: Combine cohorts safely. **Data**: cohortA_samples.csv, cohortB_samples.csv **Tasks**:
+
+-   rbindlist(list(A, B), use.names=TRUE, fill=TRUE) and verify column alignment.
+
+-   Order by cohort, condition, sample_id
+
+-   Join back to bulk_counts_long and compute per-cohort, per-condition mean counts of the top 100 most variable genes.
+
+```{r}
+library(data.table)
+
+# Load cohorts
+cohortA <- fread("cohortA_samples.csv")  
+cohortB <- fread("cohortB_samples.csv")
+
+# Combine safely
+combined <- rbindlist(list(cohortA, cohortB), use.names = TRUE, fill = TRUE)
+
+# Check column alignment
+cat("Columns in combined dataset:\n")
+print(names(combined))
+
+# Order by cohort, condition, sample_id 
+setorder(combined, cohort, condition, sample_id)
+
+# Load bulk counts in long format 
+bulk_counts_long <- fread("bulk_counts_long.csv")  
+
+
+# Join combined sample info to counts 
+counts_annot <- merge(bulk_counts_long, combined, by = "sample_id", all.x = TRUE)
+
+# Identify top 100 most variable genes
+gene_variances <- counts_annot[, .(variance = var(count)), by = gene]
+top100_genes <- gene_variances[order(-variance)][1:100, gene]
+
+# Filter counts for top 100 genes
+top_counts <- counts_annot[gene %in% top100_genes]
+
+# Compute per-cohort, per-condition mean counts
+mean_counts <- top_counts[, .(mean_count = mean(count, na.rm = TRUE)), by = .(gene, cohort, condition)]
+
+# Visualise results
+
+head(mean_counts, 5)
+
+```
+
+The analysis combines samples from two cohorts (`cohortA` and `cohortB`) and annotates bulk RNA-seq counts with cohort and condition information. After identifying the 100 most variable genes across all samples, the counts were filtered to focus on these genes. The resulting table shows the **mean expression per gene, stratified by cohort and condition**.
+
+For example, `GENE_0232` in cohort B under the treated condition has a mean count of 78, while `GENE_0245` is 29.5, reflecting differences in expression levels across genes and treatment groups.
+
+## Data.table/Data.frame comparison
+
+-   **`data.frame`**: Base R object. No additional package required
+
+-   **`data.table`**: Comes from the `data.table` package (`library(data.table)` required).
+
+```{r}
+
+# Load libraries
+library(data.table)
+library(dplyr)
+library(readr)
+library(microbenchmark)
+library(tibble)
+
+# Define dplyr/data.frame workflow 
+run_dplyr <- function() {
+  # Load cohorts
+  A <- read_csv("cohortA_samples.csv", show_col_types = FALSE)
+  B <- read_csv("cohortB_samples.csv", show_col_types = FALSE)
+  
+  # Combine safely and order
+  samples_combined <- bind_rows(A, B) %>%
+    arrange(cohort, condition, sample_id)
+  
+  # Load bulk counts
+  bulk_counts_long <- read_csv("bulk_counts_long.csv", show_col_types = FALSE)
+  
+  # Join metadata
+  merged_counts <- bulk_counts_long %>%
+    left_join(samples_combined %>% select(sample_id, cohort, condition),
+              by = "sample_id")
+  
+  # Identify top 100 most variable genes
+  gene_var <- merged_counts %>%
+    group_by(gene) %>%
+    summarise(var_count = var(count, na.rm = TRUE)) %>%
+    arrange(desc(var_count))
+  
+  top_genes <- head(gene_var$gene, 100)
+  
+  # Compute per-cohort, per-condition mean counts
+  mean_counts <- merged_counts %>%
+    filter(gene %in% top_genes) %>%
+    group_by(gene, cohort, condition) %>%
+    summarise(mean_count = mean(count, na.rm = TRUE), .groups = "drop")
+  
+  return(mean_counts)
+}
+
+# Define data.table workflow
+run_datatable <- function() {
+  # Load cohorts
+  cohortA <- fread("cohortA_samples.csv")
+  cohortB <- fread("cohortB_samples.csv")
+  
+  # Combine safely and order
+  combined <- rbindlist(list(cohortA, cohortB), use.names = TRUE, fill = TRUE)
+  setorder(combined, cohort, condition, sample_id)
+  
+  # Load bulk counts
+  bulk_counts_long <- fread("bulk_counts_long.csv")
+  
+  # Join metadata
+  counts_annot <- merge(bulk_counts_long, combined, by = "sample_id", all.x = TRUE)
+  
+  # Identify top 100 most variable genes
+  gene_variances <- counts_annot[, .(variance = var(count, na.rm = TRUE)), by = gene]
+  top100_genes <- gene_variances[order(-variance)][1:100, gene]
+  
+  # Filter and compute means
+  top_counts <- counts_annot[gene %in% top100_genes]
+  mean_counts <- top_counts[, .(mean_count = mean(count, na.rm = TRUE)),
+                            by = .(gene, cohort, condition)]
+  
+  return(mean_counts)
+}
+
+# Benchmark both workflows 
+benchmark_results <- microbenchmark(
+  dplyr_version = run_dplyr(),
+  datatable_version = run_datatable(),
+  times = 5L
+)
+
+# Summarize benchmark results
+summary_df <- as.data.frame(summary(benchmark_results))
+
+results_table <- summary_df %>%
+  dplyr::mutate(mean_time_ms = as.numeric(mean) / 1e6) %>%  # convert ns → ms
+  dplyr::mutate(Method = ifelse(expr == "dplyr_version",
+                                "dplyr/data.frame",
+                                "data.table")) %>%
+  dplyr::select(Method, Mean_Time_ms = mean_time_ms)
+
+# Compute relative speedup 
+dplyr_time <- results_table$Mean_Time_ms[results_table$Method == "dplyr/data.frame"]
+
+results_table <- results_table %>%
+  dplyr::mutate(Speedup_vs_dplyr = dplyr_time / Mean_Time_ms) %>%
+  dplyr::arrange(Method)
+
+# Print results
+print(results_table)
+
+```
+
+The table compares the performance of two methods for a data manipulation task: `data.table` versus `dplyr`/`data.frame`.
+
+-   **Mean_Time_ms** shows the average execution time per operation in milliseconds. `data.table` is extremely fast, taking approximately **0.021 milliseconds** per operation, whereas `dplyr` takes about **0.268 milliseconds**.
+
+-   **Speedup_vs_dplyr** quantifies relative performance. `data.table` is roughly **12.5 times faster** than `dplyr` for this task.
+
+This demonstrates that for large datasets, `data.table` can provide a substantial speed advantage for joins, aggregations, and other data manipulations, making it ideal for high-performance workflows in R.
+
+# Final revision
+
+**Goal**: Associate cell type to integration clusters taking tract of their belongings to normal or tumor tissue.
+
+Tasks:
+
+-   provide a new file where cell type, cells and integration clusters are combined
+
+-   provide a file where the number of each cell type is indicated for each cluster
+
+-   provide summary table showing cell types associated to integration clusters and also their association to normal and tumor tissue
+
+-   Provide a plot describing the distribution of the cell type in normal/tumor tissue given the integration clusters.
+
+-   Provide a normalized % for the cell types in each of the integration clusters for normal and tumor specimen.
+
+```{r}
+
+
+# Load required libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(RColorBrewer)
+
+
+# Load Data
+
+integration_df <- read_csv("annotated_GSM3516673_normal_annotated_GSM3516672_tumor_SeuratIntegration.csv")
+celltype_df <- read_csv("nt_combined_clustering.output.csv")
+
+
+# Clean cell IDs to match
+
+integration_df$cell <- str_trim(gsub("_X_", "", integration_df$cell))
+celltype_df$cell <- str_trim(celltype_df$cell)
+
+# Task1
+# Merge datasets by 'cell' 
+merged_df <- inner_join(celltype_df, integration_df, by = "cell")
+write_csv(merged_df, "merged_celltype_clusters.csv")
+
+# Task 2
+# Count number of cells per cell type per cluster
+
+count_df <- merged_df %>%
+  group_by(integration_cluster, cell_type) %>%
+  summarise(count = n(), .groups = 'drop')
+write_csv(count_df, "celltype_per_cluster_counts.csv")
+
+# Task 3
+# Summary table with tissue info
+
+summary_df <- merged_df %>%
+  group_by(integration_cluster, cell_type, sample_type) %>%
+  summarise(count = n(), .groups = 'drop')
+write_csv(summary_df, "celltype_cluster_tissue_summary.csv")
+
+# Task 4 - 5
+# Prepare plotting data
+
+merged_df$sample_type <- factor(merged_df$sample_type, levels = c("N", "T"))
+
+# Fill missing combinations for plotting raw counts
+plot_df <- merged_df %>%
+  group_by(integration_cluster, sample_type, cell_type) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  tidyr::complete(integration_cluster, sample_type, cell_type, fill = list(count = 0))
+
+# Fill missing combinations for plotting percentages
+percent_df <- merged_df %>%
+  group_by(integration_cluster, sample_type, cell_type) %>%
+  summarise(count = n(), .groups = 'drop') %>%
+  group_by(integration_cluster, sample_type) %>%
+  mutate(percent = count / sum(count) * 100) %>%
+  ungroup() %>%
+  tidyr::complete(integration_cluster, sample_type, cell_type, fill = list(percent = 0))
+
+write_csv(percent_df, "celltype_cluster_tissue_percent.csv")
+
+# Create color palettes
+
+# Raw counts
+n_celltypes <- length(unique(plot_df$cell_type))
+my_colors <- if(n_celltypes <= 12) {
+  brewer.pal(n_celltypes, "Set3")
+} else {
+  colorRampPalette(brewer.pal(12, "Set3"))(n_celltypes)
+}
+
+# Percentages
+n_celltypes_percent <- length(unique(percent_df$cell_type))
+my_colors_percent <- if(n_celltypes_percent <= 12) {
+  brewer.pal(n_celltypes_percent, "Set3")
+} else {
+  colorRampPalette(brewer.pal(12, "Set3"))(n_celltypes_percent)
+}
+
+
+# Plot raw counts 
+
+# Number of unique cell types
+n_celltypes <- length(unique(plot_df$cell_type))
+
+# Safe color palette
+my_colors <- if(n_celltypes <= 12) {
+  RColorBrewer::brewer.pal(n_celltypes, "Set3")
+} else {
+  colorRampPalette(RColorBrewer::brewer.pal(12, "Set3"))(n_celltypes)
+}
+
+# Raw counts plot
+print(
+  ggplot(plot_df, aes(x = integration_cluster, y = count, fill = cell_type)) +
+    geom_bar(stat = "identity") +
+    facet_wrap(~sample_type, scales = "free_y") +
+    labs(title = "Cell Type Distribution per Cluster by Tissue",
+         x = "Integration Cluster",
+         y = "Number of Cells") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_fill_manual(values = my_colors)
+)
+
+# Plot normalized percentages
+
+# Calculate number of unique cell types in percent_df
+n_celltypes_percent <- length(unique(percent_df$cell_type))
+
+# Safe color palette for percentages
+my_colors_percent <- if(n_celltypes_percent <= 12) {
+  RColorBrewer::brewer.pal(n_celltypes_percent, "Set3")
+} else {
+  colorRampPalette(RColorBrewer::brewer.pal(12, "Set3"))(n_celltypes_percent)
+}
+
+# Normalized percentages plot
+print(
+  ggplot(percent_df, aes(x = integration_cluster, y = percent, fill = cell_type)) +
+    geom_bar(stat = "identity") +
+    facet_wrap(~sample_type, scales = "free_y") +
+    labs(title = "Normalized % of Cell Types per Cluster by Tissue",
+         x = "Integration Cluster",
+         y = "Percentage of Cells") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_fill_manual(values = my_colors_percent)
+)
+
+```
+
+```{r}
+#visualise results task1 
+head(fread("merged_celltype_clusters.csv"), 5)
+```
+
+```{r}
+#visualise results task2 (celltype_per_cluster_counts.csv)
+head(fread("celltype_per_cluster_counts.csv"), 5)
+```
+
+```{r}
+#visualise results task3 (celltype_cluster_tissue_summary.csv)
+head(fread("celltype_cluster_tissue_summary.csv"), 5)
+```
